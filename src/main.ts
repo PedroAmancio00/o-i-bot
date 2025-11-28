@@ -18,8 +18,8 @@ Devvit.addTrigger({
 	event: 'AppUpgrade',
 	onEvent: async (_, context) => {
 		console.log('App upgraded!');
-		reagendarJobs(context);
-		countVotesJob(context);
+		await reagendarJobs(context);
+		await countVotesJob(context);
 	},
 });
 

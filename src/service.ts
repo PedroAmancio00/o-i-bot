@@ -66,7 +66,11 @@ export const onPostCreate = async (event: PostCreate, context: TriggerContext) =
 
 	//Cria a data para checagem futura
 	const date = new Date();
-	console.log(`Novo post criado com o título: ${post.title}, id: ${post.id}, data: ${date.toUTCString()}`);
+	console.log(
+		`Novo post criado com o título: ${post.title}, id: ${post.id}, data: ${date.toLocaleString('pt-BR', {
+			timeZone: 'America/Sao_Paulo',
+		})}`
+	);
 	date.setDate(date.getDate() + TimeToCheck);
 
 	const comment = await context.reddit.submitComment({
@@ -78,7 +82,9 @@ Que comecem os votos! Use os seguintes marcadores nos comentários para votar:
 - Opinião Específica (O/E): 0
 - Votos Totais: 0
 
-- Resultado: (Aguardando votos)`,
+- Resultado: (Aguardando votos)
+
+Os resultados atualizam a cada hora`,
 	});
 
 	await comment.distinguish(true);
@@ -98,7 +104,7 @@ Que comecem os votos! Use os seguintes marcadores nos comentários para votar:
 	await registerKey(context, key);
 };
 
-const countVotes = (votes: Votes, comment: string) => {
+const determineVote = (votes: Votes, comment: string) => {
 	// Mapeia cada marcador para o campo correspondente
 	const matchers: Record<string, keyof Votes> = {
 		'O/I': 'opiniaoImpopular',
@@ -128,11 +134,12 @@ const countVotes = (votes: Votes, comment: string) => {
 
 export const onCommentCreate = async (event: CommentCreate, context: TriggerContext) => {
 	const { comment } = event;
+	const { reddit, redis } = context;
 
 	// Verifica se o comentário é uma resposta a um post
-	if (!comment || !comment?.parentId?.startsWith('t3_')) return;
+	if (!comment || !comment?.parentId?.startsWith('t3_') || !reddit || !redis) return;
 
-	const post = await context.reddit.getPostById(comment.parentId);
+	const post = await reddit.getPostById(comment.parentId);
 	// Se não encontrar o post, sai
 	if (!post) return;
 
@@ -148,16 +155,34 @@ export const onCommentCreate = async (event: CommentCreate, context: TriggerCont
 		);
 		return;
 	}
-	console.log(`Registrando voto do comentário ID: ${comment.id} para o post ID: ${post.id}`);
+	const now = new Date();
+	console.log(
+		`Registrando voto do comentário ID: ${comment.id} para o post ID: ${post.id}, data atual: ${now.toLocaleString(
+			'pt-BR',
+			{ timeZone: 'America/Sao_Paulo' }
+		)}`
+	);
 	const key = post.id;
-	const votesData = await context.redis.get(key);
-	if (!votesData) {
-		console.log(`Nenhum dado de votos encontrado para o post ID: ${post.id}`);
-		return;
+	try {
+		const votesData = await redis.get(key);
+		if (!votesData) {
+			console.log(`Nenhum dado de votos encontrado para o post ID: ${post.id}`);
+			return;
+		}
+		const votes: Votes = JSON.parse(votesData);
+		determineVote(votes, comment.body);
+		const text = await countVote(votes);
+		const fixedComment = await reddit.getCommentById(votes.commentId);
+		if (fixedComment) {
+			await fixedComment.edit({ text });
+			console.log(`Comentário atualizado para a chave: ${key}`);
+		} else {
+			console.log(`Comentário não encontrado para a chave: ${key}`);
+		}
+		await redis.set(key, JSON.stringify(votes));
+	} catch (error) {
+		console.error(`Erro ao processar votos para a chave: ${key}`, error);
 	}
-	const votes: Votes = JSON.parse(votesData);
-	countVotes(votes, comment.body);
-	await context.redis.set(key, JSON.stringify(votes));
 };
 
 const determineResult = (votes: Votes): string => {
@@ -204,30 +229,47 @@ const determineParcialResult = (votes: Votes): string => {
 	return labels[topKey] ?? 'Resultado desconhecido';
 };
 
+async function clearJobs(context: TriggerContext) {
+	const jobs = await context.scheduler.listJobs();
+	console.log(`Jobs encontrados: ${jobs.length}`);
+	for (const job of jobs) {
+		console.log(`Cancelando: (${job.name})`);
+		await context.scheduler.cancelJob(job.id);
+	}
+}
+
 export async function reagendarJobs(context: TriggerContext) {
 	console.log('Cancelando jobs antigos...');
 	try {
-		const jobs = await context.scheduler.listJobs();
-		console.log(`Jobs encontrados: ${jobs.length}`);
-		for (const job of jobs) {
-			console.log(`Cancelando: (${job.name})`);
-			await context.scheduler.cancelJob(job.id);
-		}
+		await clearJobs(context);
 	} catch (err: any) {
 		console.error('Erro ao listar/cancelar jobs:', err.message);
 	}
 
-	console.log('Agendando countVotes a cada 1 hora...');
-	try {
-		await context.scheduler.runJob({
-			name: 'countVotes',
-			cron: '0 * * * *', // a cada hora cheia
-			// cron: '*/1 * * * *' // pra teste a cada 1 min
-		});
-		console.log('Job countVotes agendado com sucesso!');
-	} catch (err: any) {
-		console.error('Erro ao agendar:', err.message);
-	}
+	// console.log('Agendando countVotes a cada 1 hora...');
+	// try {
+	// 	await context.scheduler.runJob({
+	// 		name: 'countVotes',
+	// 		cron: '0 * * * *', // a cada hora cheia
+	// 		// cron: '*/1 * * * *' // pra teste a cada 1 min
+	// 	});
+	// 	console.log('Job countVotes agendado com sucesso!');
+	// } catch (err: any) {
+	// 	console.error('Erro ao agendar:', err.message);
+	// }
+}
+
+async function countVote(votes: Votes) {
+	const result = determineParcialResult(votes);
+	return `
+Que comecem os votos! Use os seguintes marcadores nos comentários para votar:
+
+- Opinião Impopular (O/I): ${votes.opiniaoImpopular}
+- Opinião Popular (O/P): ${votes.opiniaoPopular}
+- Opinião Específica (O/E): ${votes.opiniaoEspecifica}
+- Votos Totais: ${votes.total}
+
+- Resultado: ${result}`;
 }
 
 export async function countVotesJob(context: TriggerContext) {
@@ -257,15 +299,9 @@ export async function countVotesJob(context: TriggerContext) {
 				continue;
 			}
 			const votes: Votes = JSON.parse(votesData);
-			const result = determineParcialResult(votes);
-			const text = `
-Que comecem os votos! Use os seguintes marcadores nos comentários para votar:
-- Opinião Impopular (O/I): ${votes.opiniaoImpopular}
-- Opinião Popular (O/P): ${votes.opiniaoPopular}
-- Opinião Específica (O/E): ${votes.opiniaoEspecifica}
-- Votos Totais: ${votes.total}
 
-- Resultado: ${result}`;
+			const text = await countVote(votes);
+
 			const comment = await reddit.getCommentById(votes.commentId);
 			if (comment) {
 				await comment.edit({ text });
